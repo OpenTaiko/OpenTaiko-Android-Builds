@@ -1,0 +1,285 @@
+# Builds the OpenTaiko Android APK and publishes it as a GitHub release.
+#
+# - Game code: latest release of the OpenTaiko repository (or a ref given on manual runs).
+# - Skin: latest Open-World Memories, plus every Character and PuchiChara, from OpenTaiko-Skins.
+# - Songs are not bundled: the app offers to download the soundtrack on first launch.
+#
+# The release tag and name come from package.txt. Bump it to publish a new release; a version
+# that already has a tag is skipped.
+
+name: Build Android Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - package.txt
+      - .github/workflows/build-release.yaml
+  workflow_dispatch:
+    inputs:
+      opentaiko_ref:
+        description: "OpenTaiko tag, branch or commit to build (empty = latest release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release
+  cancel-in-progress: false
+
+env:
+  OPENTAIKO_REPO: 0auBSQ/OpenTaiko
+  SKINS_REPO: OpenTaiko/OpenTaiko-Skins
+  SKIN_FOLDER: Open-World Memories
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pkg.outputs.version }}
+      exists: ${{ steps.pkg.outputs.exists }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read package version
+        id: pkg
+        run: |
+          version="$(head -n 1 package.txt | tr -d '[:space:]')"
+          if ! [[ "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo "::error file=package.txt::Invalid package version '$version'"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$version" > /dev/null; then
+            echo "::notice::Tag $version already exists, nothing to release. Bump package.txt to publish a new one."
+            exists=true
+          else
+            exists=false
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.exists == 'false'
+    runs-on: windows-latest
+    env:
+      PACKAGE_VERSION: ${{ needs.check.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Configure git
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+      - name: Resolve OpenTaiko ref
+        id: ot
+        env:
+          INPUT_REF: ${{ github.event.inputs.opentaiko_ref }}
+        run: |
+          $ref = "$env:INPUT_REF".Trim()
+          if (-not $ref) {
+            $ref = gh release view --repo $env:OPENTAIKO_REPO --json tagName --jq .tagName
+            if ($LASTEXITCODE -ne 0 -or -not $ref) { throw "Could not read the latest release of $env:OPENTAIKO_REPO" }
+          }
+          Write-Host "OpenTaiko ref: $ref"
+          "ref=$ref" >> $env:GITHUB_OUTPUT
+
+      - name: Checkout OpenTaiko
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.OPENTAIKO_REPO }}
+          ref: ${{ steps.ot.outputs.ref }}
+          path: ot
+
+      - name: Read OpenTaiko version
+        id: otver
+        env:
+          OT_REF: ${{ steps.ot.outputs.ref }}
+        run: |
+          $csproj = Get-Content -Raw "ot/OpenTaiko/OpenTaiko.csproj"
+          if ($csproj -notmatch '<Version>\s*([^<]+?)\s*</Version>') { throw "No <Version> in OpenTaiko.csproj" }
+          $version = $Matches[1]
+          $sha = (git -C ot rev-parse HEAD).Trim()
+          if (-not (Test-Path "ot/OpenTaiko.Android/OpenTaiko.Android.csproj")) {
+            throw "OpenTaiko ref '$env:OT_REF' has no OpenTaiko.Android project"
+          }
+          Write-Host "OpenTaiko $version ($sha)"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Fetch skin, Characters and PuchiChara
+        id: skin
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse "https://github.com/$env:SKINS_REPO.git" skins
+          if ($LASTEXITCODE -ne 0) { throw "Cloning $env:SKINS_REPO failed" }
+          git -C skins sparse-checkout set "System/$env:SKIN_FOLDER" "Global/Characters" "Global/PuchiChara"
+          if ($LASTEXITCODE -ne 0) { throw "Sparse checkout failed" }
+
+          $config = "skins/System/$env:SKIN_FOLDER/SkinConfig.ini"
+          if (-not (Test-Path -LiteralPath $config)) { throw "$config not found" }
+          $name = $null; $version = $null
+          foreach ($line in Get-Content -LiteralPath $config -Encoding UTF8) {
+            if (-not $name -and $line -match '^\s*Name\s*=\s*(.+?)\s*$') { $name = $Matches[1] }
+            if (-not $version -and $line -match '^\s*Version\s*=\s*(.+?)\s*$') { $version = $Matches[1] }
+          }
+          if (-not $name) { $name = $env:SKIN_FOLDER }
+          if (-not $version) { $version = "Unknown" }
+          $sha = (git -C skins rev-parse HEAD).Trim()
+          $charas = @(Get-ChildItem -Directory -LiteralPath "skins/Global/Characters").Count
+          $puchis = @(Get-ChildItem -Directory -LiteralPath "skins/Global/PuchiChara").Count
+          Write-Host "Skin: $name $version ($sha), $charas characters, $puchis puchichara"
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "charas=$charas" >> $env:GITHUB_OUTPUT
+          "puchis=$puchis" >> $env:GITHUB_OUTPUT
+
+      - name: Merge skin assets into OpenTaiko
+        run: |
+          # Replace the skin wholesale so files removed upstream don't linger.
+          $skinDst = "ot/OpenTaiko/System/$env:SKIN_FOLDER"
+          if (Test-Path -LiteralPath $skinDst) { Remove-Item -LiteralPath $skinDst -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "ot/OpenTaiko/System" | Out-Null
+          Copy-Item -LiteralPath "skins/System/$env:SKIN_FOLDER" -Destination "ot/OpenTaiko/System" -Recurse -Force
+
+          # Add every Character and PuchiChara next to the ones OpenTaiko ships ("00 - None").
+          foreach ($kind in @("Characters", "PuchiChara")) {
+            $dst = "ot/OpenTaiko/Global/$kind"
+            New-Item -ItemType Directory -Force -Path $dst | Out-Null
+            Get-ChildItem -Directory -LiteralPath "skins/Global/$kind" | ForEach-Object {
+              $target = Join-Path $dst $_.Name
+              if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+              Copy-Item -LiteralPath $_.FullName -Destination $dst -Recurse -Force
+            }
+          }
+          Get-ChildItem -Directory "ot/OpenTaiko/Global/Characters", "ot/OpenTaiko/Global/PuchiChara" | ForEach-Object { Write-Host "  $($_.Parent.Name)/$($_.Name)" }
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install .NET Android workload
+        run: |
+          dotnet workload install android
+          if ($LASTEXITCODE -ne 0) { throw "dotnet workload install android failed" }
+
+      - name: Fetch native libraries and FFmpeg binding
+        run: |
+          & "ot/OpenTaiko.Android/scripts/download-bass.ps1"
+          & "ot/OpenTaiko.Android/scripts/download-ffmpeg.ps1"
+          & "ot/OpenTaiko.Android/scripts/fetch-ffmpeg-autogen.ps1"
+          $global:LASTEXITCODE = 0
+
+      - name: Install Android SDK dependencies
+        run: |
+          dotnet build "ot/OpenTaiko.Android/OpenTaiko.Android.csproj" -t:InstallAndroidDependencies `
+            -f net10.0-android -p:UseVendoredFFmpeg=true `
+            "-p:AndroidSdkDirectory=$env:ANDROID_HOME" "-p:JavaSdkDirectory=$env:JAVA_HOME" `
+            -p:AcceptAndroidSDKLicenses=true
+          if ($LASTEXITCODE -ne 0) { throw "InstallAndroidDependencies failed" }
+
+      - name: Prepare signing key
+        id: sign
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if ($env:ANDROID_KEYSTORE_BASE64) {
+            $path = Join-Path $env:RUNNER_TEMP "release.keystore"
+            [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:ANDROID_KEYSTORE_BASE64))
+            "keystore=$path" >> $env:GITHUB_OUTPUT
+            Write-Host "Signing with the release keystore."
+          } else {
+            Write-Host "::warning::ANDROID_KEYSTORE_BASE64 is not set: the APK is signed with a throwaway debug key, so players must uninstall the previous release before installing this one."
+          }
+
+      - name: Build APK
+        env:
+          KEYSTORE_PATH: ${{ steps.sign.outputs.keystore }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          $buildArgs = @(
+            "build", "ot/OpenTaiko.Android/OpenTaiko.Android.csproj",
+            "-f", "net10.0-android",
+            "-c", "Release",
+            # Required by the Android project: vendored FFmpeg binding, and unoptimized IL
+            # (optimized IL crashes the Mono interpreter at boot).
+            "-p:UseVendoredFFmpeg=true",
+            "-p:Optimize=false",
+            "-p:AndroidSdkDirectory=$env:ANDROID_HOME",
+            "-p:JavaSdkDirectory=$env:JAVA_HOME",
+            # A new version code per build makes the app re-run asset extraction after an update.
+            "-p:ApplicationVersion=$env:GITHUB_RUN_NUMBER",
+            "-p:ApplicationDisplayVersion=$env:PACKAGE_VERSION"
+          )
+          if ($env:KEYSTORE_PATH) {
+            $keyPass = if ($env:ANDROID_KEY_PASSWORD) { "env:ANDROID_KEY_PASSWORD" } else { "env:ANDROID_KEYSTORE_PASSWORD" }
+            $buildArgs += @(
+              "-p:AndroidKeyStore=true",
+              "-p:AndroidSigningKeyStore=$env:KEYSTORE_PATH",
+              "-p:AndroidSigningStorePass=env:ANDROID_KEYSTORE_PASSWORD",
+              "-p:AndroidSigningKeyAlias=$env:ANDROID_KEY_ALIAS",
+              "-p:AndroidSigningKeyPass=$keyPass"
+            )
+          }
+          & dotnet @buildArgs
+          if ($LASTEXITCODE -ne 0) { throw "dotnet build failed (exit $LASTEXITCODE)" }
+
+          $apk = Get-ChildItem -Recurse "ot/OpenTaiko.Android/bin/Release" -Filter "*-Signed.apk" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $apk) { throw "No signed APK found under ot/OpenTaiko.Android/bin/Release" }
+          $out = "OpenTaiko-Android-${env:PACKAGE_VERSION}.apk"
+          Copy-Item -LiteralPath $apk.FullName -Destination $out
+          Write-Host ("APK: {0} ({1:N0} MB)" -f $out, ($apk.Length / 1MB))
+
+      - name: Write release notes
+        env:
+          OT_REF: ${{ steps.ot.outputs.ref }}
+          OT_VERSION: ${{ steps.otver.outputs.version }}
+          OT_SHA: ${{ steps.otver.outputs.sha }}
+          SKIN_NAME: ${{ steps.skin.outputs.name }}
+          SKIN_VERSION: ${{ steps.skin.outputs.version }}
+          SKIN_SHA: ${{ steps.skin.outputs.sha }}
+          CHARAS: ${{ steps.skin.outputs.charas }}
+          PUCHIS: ${{ steps.skin.outputs.puchis }}
+        run: |
+          $otShort = $env:OT_SHA.Substring(0, 7)
+          $skinShort = $env:SKIN_SHA.Substring(0, 7)
+          $notes = @"
+          ## OpenTaiko Android Package $env:PACKAGE_VERSION
+
+          | Component | Version |
+          | --- | --- |
+          | OpenTaiko | **$env:OT_VERSION** ([$env:OT_REF](https://github.com/$env:OPENTAIKO_REPO/tree/$env:OT_REF), commit [``$otShort``](https://github.com/$env:OPENTAIKO_REPO/commit/$env:OT_SHA)) |
+          | Skin | **$env:SKIN_NAME** version **$env:SKIN_VERSION** ([OpenTaiko-Skins](https://github.com/$env:SKINS_REPO) commit [``$skinShort``](https://github.com/$env:SKINS_REPO/commit/$env:SKIN_SHA)) |
+
+          Also includes all $env:CHARAS Characters and $env:PUCHIS PuchiChara from OpenTaiko-Skins.
+
+          Songs are not included: on first launch the app offers to download the official soundtrack.
+
+          ### Install
+          Download ``OpenTaiko-Android-${env:PACKAGE_VERSION}.apk`` on your Android device (Android 7.0+, arm64) and open it. You may need to allow installing apps from unknown sources.
+          "@
+          Set-Content -Path release-notes.md -Value $notes -Encoding utf8
+          Get-Content release-notes.md
+
+      - name: Create release
+        run: |
+          gh release create "$env:PACKAGE_VERSION" "OpenTaiko-Android-${env:PACKAGE_VERSION}.apk" `
+            --repo "$env:GITHUB_REPOSITORY" `
+            --target "$env:GITHUB_SHA" `
+            --title "OpenTaiko Android Package $env:PACKAGE_VERSION" `
+            --notes-file release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
